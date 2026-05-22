@@ -1,0 +1,42 @@
+import boto3
+from datetime import datetime, timezone
+
+def restore_date_range(bucket, from_date_str, to_date_str, prefix=''):
+    s3 = boto3.client('s3', region_name='ap-southeast-2')
+    
+    from_date = datetime.strptime(from_date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    to_date   = datetime.strptime(to_date_str,   '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    
+    paginator = s3.get_paginator('list_object_versions')
+    restored = []
+
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for marker in page.get('DeleteMarkers', []):
+            if marker['IsLatest'] and from_date <= marker['LastModified'] <= to_date:
+                s3.delete_object(
+                    Bucket=bucket,
+                    Key=marker['Key'],
+                    VersionId=marker['VersionId']
+                )
+                restored.append(marker['Key'])
+                print(f"Restored: {marker['Key']}")
+    
+    print(f"\nTotal restored: {len(restored)}")
+
+restore_date_range(
+    bucket='mpldw-prod-optimized',
+    prefix='ats_dm/current/master_exec_dtl/20260515_1778840516/',
+    from_date_str='2026-05-15',
+    to_date_str='2026-05-23'
+)
+
+aws s3api list-object-versions \
+  --bucket mpldw-prod-optimized \
+  --prefix "ats_dm/current/master_exec_dtl/20260515_1778840516/" \
+  --region ap-southeast-2 \
+  --query "DeleteMarkers[?IsLatest==\`true\`]"
+
+
+
+
+
