@@ -1,0 +1,106 @@
+import boto3
+import csv
+from datetime import datetime, timezone
+
+def restore_date_range(bucket, from_date_str, to_date_str, prefix='', dry_run=True, output_s3_bucket=None, output_s3_prefix='restore-reports/'):
+    s3 = boto3.client('s3', region_name='ap-southeast-2')
+    
+    from_date = datetime.strptime(from_date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    to_date   = datetime.strptime(to_date_str,   '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    
+    paginator = s3.get_paginator('list_object_versions')
+    results   = []
+
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for marker in page.get('DeleteMarkers', []):
+            if marker['IsLatest'] and from_date <= marker['LastModified'] <= to_date:
+                key         = marker['Key']
+                folder_path = '/'.join(key.split('/')[:-1]) + '/'
+                file_name   = key.split('/')[-1]
+                deleted_at  = marker['LastModified'].strftime('%Y-%m-%d %H:%M:%S UTC')
+                restored_at = 'N/A'
+                status      = 'WILL BE RESTORED' if dry_run else 'FAILED'
+
+                file_size = 'N/A'
+                for v in page.get('Versions', []):
+                    if v['Key'] == key and not v['IsLatest']:
+                        file_size = f"{round(v['Size'] / 1024, 2)} KB"
+                        break
+
+                if not dry_run:
+                    try:
+                        s3.delete_object(
+                            Bucket=bucket,
+                            Key=key,
+                            VersionId=marker['VersionId']
+                        )
+                        status      = 'RESTORED'
+                        restored_at = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+                    except Exception as e:
+                        status = f'FAILED: {str(e)}'
+
+                results.append({
+                    'bucket'          : bucket,
+                    'folder_path'     : folder_path,
+                    'file_name'       : file_name,
+                    'file_size'       : file_size,
+                    'deleted_at'      : deleted_at,
+                    'restored_at'     : restored_at,
+                    'delete_marker_id': marker['VersionId'],
+                    'restore_status'  : status
+                })
+
+    # Write CSV locally
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    mode_tag  = 'dry_run' if dry_run else 'restored'
+    csv_file  = f"s3_restore_{mode_tag}_{timestamp}.csv"
+
+    with open(csv_file, 'w', newline='') as f:
+        fieldnames = ['bucket', 'folder_path', 'file_name', 'file_size',
+                      'deleted_at', 'restored_at', 'delete_marker_id', 'restore_status']
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+
+    # Upload CSV to S3
+    s3_csv_path = 'N/A'
+    if output_s3_bucket:
+        s3_key      = f"{output_s3_prefix}{csv_file}"
+        s3_csv_path = f"s3://{output_s3_bucket}/{s3_key}"
+        s3.upload_file(csv_file, output_s3_bucket, s3_key)
+
+    # Summary — console only
+    total_restored = sum(1 for r in results if r['restore_status'] == 'RESTORED')
+    total_preview  = sum(1 for r in results if r['restore_status'] == 'WILL BE RESTORED')
+    total_failed   = sum(1 for r in results if 'FAILED' in r['restore_status'])
+
+    print(f"\n{'='*60}")
+    print(f"  Mode          : {'DRY RUN' if dry_run else 'LIVE RESTORE'}")
+    print(f"  Bucket        : {bucket}")
+    print(f"  Date Range    : {from_date_str} → {to_date_str}")
+    print(f"  {'Files to Restore' if dry_run else 'Files Restored'} : {total_preview if dry_run else total_restored}")
+    if not dry_run:
+        print(f"  Files Failed  : {total_failed}")
+    print(f"  CSV (local)   : {csv_file}")
+    print(f"  CSV (S3)      : {s3_csv_path}")
+    print(f"{'='*60}\n")
+
+
+# ─── RUN CONFIG ───────────────────────────────────────────────────────────────
+
+BUCKET          = ''
+PREFIX          = ''
+FROM_DATE       = '2026-05-15'
+TO_DATE         = '2026-05-23'
+OUTPUT_S3_BUCKET= ''           # <── bucket to save the CSV
+OUTPUT_S3_PREFIX= 'restore-reports/'               # <── folder path in S3
+
+restore_date_range(
+    bucket          = BUCKET,
+    prefix          = PREFIX,
+    from_date_str   = FROM_DATE,
+    to_date_str     = TO_DATE,
+    dry_run         = False,
+    output_s3_bucket= OUTPUT_S3_BUCKET,
+    output_s3_prefix= OUTPUT_S3_PREFIX
+)
