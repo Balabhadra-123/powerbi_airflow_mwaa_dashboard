@@ -1,0 +1,75 @@
+import boto3
+import csv
+from datetime import datetime, timezone
+
+def preview_restore(bucket, from_date_str, to_date_str, prefix=''):
+    s3 = boto3.client('s3', region_name='ap-southeast-2')
+    
+    from_date = datetime.strptime(from_date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    to_date   = datetime.strptime(to_date_str,   '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    
+    paginator = s3.get_paginator('list_object_versions')
+    preview   = []
+
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for marker in page.get('DeleteMarkers', []):
+            if marker['IsLatest'] and from_date <= marker['LastModified'] <= to_date:
+                key         = marker['Key']
+                folder_path = '/'.join(key.split('/')[:-1]) + '/'
+                file_name   = key.split('/')[-1]
+                deleted_at  = marker['LastModified'].strftime('%Y-%m-%d %H:%M:%S UTC')
+
+                file_size = 'N/A'
+                for v in page.get('Versions', []):
+                    if v['Key'] == key and not v['IsLatest']:
+                        file_size = f"{round(v['Size'] / 1024, 2)} KB"
+                        break
+
+                preview.append({
+                    'bucket'          : bucket,
+                    'folder_path'     : folder_path,
+                    'file_name'       : file_name,
+                    'deleted_at'      : deleted_at,
+                    'file_size'       : file_size,
+                    'delete_marker_id': marker['VersionId'],
+                    'restore_status'  : 'WILL BE RESTORED'
+                })
+
+    # Print to console
+    print(f"\n{'='*90}")
+    print(f"  DRY RUN PREVIEW — Files that will be restored")
+    print(f"{'='*90}")
+    print(f"  Bucket     : {bucket}")
+    print(f"  Prefix     : {prefix}")
+    print(f"  Date Range : {from_date_str} → {to_date_str}")
+    print(f"{'='*90}\n")
+
+    if not preview:
+        print("  No deleted files found in the given date range and prefix.")
+    else:
+        print(f"  {'#':<4} {'File Name':<45} {'Size':<12} {'Deleted At':<25} {'Status'}")
+        print(f"  {'-'*4} {'-'*45} {'-'*12} {'-'*25} {'-'*20}")
+        for i, row in enumerate(preview, 1):
+            print(f"  {i:<4} {row['file_name']:<45} {row['file_size']:<12} {row['deleted_at']:<25} {row['restore_status']}")
+
+    print(f"\n  Total files to be restored: {len(preview)}")
+    print(f"{'='*90}\n")
+
+    # Write to CSV
+    timestamp  = datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv_file   = f"dry_run_restore_{timestamp}.csv"
+
+    with open(csv_file, 'w', newline='') as f:
+        fieldnames = ['bucket', 'folder_path', 'file_name', 'deleted_at', 'file_size', 'delete_marker_id', 'restore_status']
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(preview)
+
+    print(f"  CSV saved: {csv_file}\n")
+
+preview_restore(
+    bucket='mpldw-prod-optimized',
+    prefix='ats_dm/current/master_exec_dtl/20260515_1778840516/',
+    from_date_str='2026-05-15',
+    to_date_str='2026-05-23'
+)
