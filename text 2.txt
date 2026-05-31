@@ -1,0 +1,233 @@
+Step 7 — Build the Slicers
+
+First set your canvas size. Go to View → Page Size → Custom and set Width: 1280, Height: 900. This gives you a proper dashboard layout.
+
+Adding the three slicers:
+
+For each slicer go to Visualizations pane → Slicer icon
+
+Slicer 1 — Source
+
+	•	Field: dag_mapping[source]
+	•	Format → Slicer Settings → Style → Tile (gives you the chip/button look)
+	•	Format → Values → Font size: 11
+	•	Turn OFF the “Select All” option if you want clean single selection
+
+Slicer 2 — Type
+
+	•	Field: dag_mapping[dag_type]
+	•	Same formatting as above
+
+Slicer 3 — Status
+
+	•	This one is different — you cannot use dag_execution_today[status_label] directly because Not Started DAGs have no row in the DB, so they would not appear in the slicer
+	•	Instead create a separate disconnected table for the status slicer
+
+Go to Home → Enter Data and create this table manually:
+
+|status_display|
+|--------------|
+|Completed     |
+|Failed        |
+|Running       |
+|Not Started   |
+
+Name it status_slicer. Do not create a relationship between this table and any other table.
+
+	•	Add the slicer using status_slicer[status_display]
+	•	Format same as above — Tile style
+
+Now you need a measure that responds to this slicer. Replace your existing measures with these slicer-aware versions:
+
+Completed =
+VAR selected = SELECTEDVALUE(status_slicer[status_display], "All")
+RETURN
+IF(
+    selected = "All" || selected = "Completed",
+    CALCULATE(
+        COUNTROWS(dag_execution_today),
+        dag_execution_today[status_label] = "Completed"
+    ),
+    0
+)
+
+
+Do the same pattern for Failed and Running. For the table visual the filtering will be handled differently — explained in Step 11.
+
+Step 8 — Build the KPI Cards
+
+You need 5 cards. In Power BI the cleanest way is using the Card visual (not the new Card (v2) for now — the classic one is easier to format).
+
+For each card:
+
+	1.	Click blank canvas area
+	2.	Select Card from Visualizations pane
+	3.	Drag the measure into the Fields well
+
+|Card       |Measure        |Accent colour to set|
+|-----------|---------------|--------------------|
+|Total DAGs |`[Total DAGs]` |Blue #1565C0        |
+|Completed  |`[Completed]`  |Green #1B7F4F       |
+|Failed     |`[Failed]`     |Red #C0392B         |
+|Running    |`[Running]`    |Blue #1976D2        |
+|Not Started|`[Not Started]`|Grey #4B5A6E        |
+
+Formatting each card:
+
+	•	Format → Data Label → Font size: 28, Bold: On, Colour: set to the accent above
+	•	Format → Category Label → rename to your label (e.g. “Total DAGs Today”)
+	•	Format → Background → White
+	•	Format → Border → On, colour light grey #E2E6ED, rounded corners: 4px
+	•	Turn OFF title
+
+Arrange all 5 cards in a single row at the top below the slicers. Make them equal width.
+
+Step 9 — Build the Duration Bar Chart
+
+This shows all DAGs sorted by duration descending, with Not Started DAGs at the bottom.
+
+First create this measure:
+
+Duration Minutes Display =
+IF(
+    ISBLANK(MAX(dag_execution_today[duration_minutes])),
+    0,
+    MAX(dag_execution_today[duration_minutes])
+)
+
+
+Building the visual:
+
+	1.	Select Clustered Bar Chart from Visualizations pane
+	2.	Configure the fields:
+	•	Y-axis: dag_mapping[dag_name]
+	•	X-axis: [Duration Minutes Display]
+	•	Legend: dag_execution_today[status_label]
+
+Formatting:
+
+	•	Format → Y-axis → Sort by [Duration Minutes Display] descending
+	•	Format → Data Colors — set manually:
+	•	Completed → Green #27AE60
+	•	Failed → Red #E74C3C
+	•	Running → Blue #2196F3
+	•	Not Started / blank → Grey #CBD5E0
+	•	Format → X-axis → Title: “Duration (minutes)”
+	•	Format → Gridlines → light grey, thin
+	•	Format → Background → White
+	•	Turn off Legend title, keep legend at top
+	•	Format → Data labels → On, font size 10
+Not Started DAGs will show a zero/blank bar — that is correct and expected. It tells you at a glance which DAGs have not run yet.
+
+Step 10 — Build the Completion by Source and Type
+
+For this use a Clustered Bar Chart for each, or combine into one using a matrix. The bar chart approach is cleaner for beginners.
+
+First create this measure:
+
+Completion % =
+DIVIDE(
+    CALCULATE(
+        COUNTROWS(dag_execution_today),
+        dag_execution_today[status_label] = "Completed"
+    ),
+    COUNTROWS(dag_mapping),
+    0
+) * 100
+
+
+Chart 1 — By Source:
+
+	1.	Select Clustered Bar Chart
+	2.	Y-axis: dag_mapping[source]
+	3.	X-axis: [Completion %]
+	4.	Format → X-axis → Min: 0, Max: 100
+	5.	Format → Data labels → On, format as percentage
+	6.	Data colour → Blue #1976D2
+
+Chart 2 — By Type:
+
+	•	Same setup but Y-axis: dag_mapping[dag_type]
+
+Place these two charts side by side in the mid section of your canvas, to the right of the duration chart.
+
+Step 11 — Build the DAG Detail Table
+
+This is the most important visual — it must show all DAGs from Excel including Not Started ones.
+
+	1.	Select Table visual from Visualizations pane
+	2.	Add these columns in this order:
+
+|Column          |Source                                 |
+|----------------|---------------------------------------|
+|dag_name        |`dag_mapping[dag_name]`                |
+|source          |`dag_mapping[source]`                  |
+|dag_type        |`dag_mapping[dag_type]`                |
+|schedule        |`dag_schedule[schedule]`               |
+|schedule_desc   |`dag_schedule[schedule_desc]`          |
+|status_label    |`dag_execution_today[status_label]`    |
+|dag_start_time  |`dag_execution_today[dag_start_time]`  |
+|dag_end_time    |`dag_execution_today[dag_end_time]`    |
+|duration_minutes|`[Duration Minutes Display]`           |
+|dag_execution_id|`dag_execution_today[dag_execution_id]`|
+
+Because the relationship is driven from dag_mapping, all 42 DAGs will appear. The DB columns (status, start time, end time) will show blank for Not Started DAGs — which is correct.
+
+Formatting the table:
+
+	•	Format → Style → Minimal (clean, no heavy borders)
+	•	Format → Column headers → Bold, background #FAFBFD, font size 11
+	•	Format → Values → font size 12
+	•	Format → Grid → Horizontal gridlines only, colour #EEF1F5
+	•	Format → Conditional formatting on status_label:
+	•	Go to Format → Cells → Conditional formatting → Background colour
+	•	Rules:
+	•	If value = “Completed” → light green #E6F4EE
+	•	If value = “Failed” → light red #FDECEA
+	•	If value = “Running” → light blue #E8F0FE
+	•	If value is blank (Not Started) → light grey #F0F2F5
+
+Sorting:
+
+	•	Click the status_label column header to sort — or set default sort to dag_start_time descending so latest runs appear first
+
+Step 12 — Set Up Auto Refresh
+
+This is done in Power BI Service (browser), not Desktop.
+
+	1.	First publish the report — in Desktop click Home → Publish → select your workspace
+	2.	Go to app.powerbi.com
+	3.	Find your dataset in the workspace
+	4.	Click the three dots → Settings
+	5.	Go to Scheduled Refresh
+	6.	Toggle Keep your data up to date → On
+	7.	Set refresh frequency — for a live operations dashboard set every 30 minutes or every 1 hour
+	8.	Add your timezone — AEST
+
+For DirectQuery tables (your DB), data is always live — every time someone opens or interacts with the report it queries the DB in real time. The scheduled refresh above only applies to the Excel (Import) table. So in practice your DB data is always current, and the Excel mapping refreshes on the schedule you set.
+
+One important thing — Power BI Service needs a gateway to reach your RDS database since it is inside Medibank’s AWS VPC. Check with your admin if an On-premises Data Gateway is already installed. If not, that needs to be set up before scheduled refresh will work for the DB connection.
+
+Step 13 — Publish, Format and Share
+
+Final layout pass in Desktop before publishing:
+
+	•	Header area: three slicers side by side across the top
+	•	Row 1: five KPI cards equal width
+	•	Row 2 left (wider): Duration bar chart
+	•	Row 2 right (narrower): Completion by Source + by Type stacked
+	•	Row 3: Full width DAG detail table
+
+Page settings:
+
+	•	Format → Page background → colour #F4F6F9 (light grey — matches the mockup)
+	•	Add a Text Box at the very top for the title: MWAA DAG Operations — Today's Status
+	•	Font size 16, bold, colour #1A2332
+
+Publishing:
+
+	1.	Click Home → Publish
+	2.	Select your workspace
+	3.	Once published go to Power BI Service
+	4.	Open the report and click Share to send to your team
+	5.	You can also pin visuals to a Dashboard in Power BI Service for a summary view
