@@ -1,0 +1,164 @@
+Good call — we’ll push all the logic into the SQL query itself so nothing needs to be created in the database.
+
+Step 1 — Prepare the Excel Mapping File
+
+This is the foundation of your DAG universe. Create an Excel file with exactly these three columns:
+
+
+
+|dag_name                 |source |dag_type |
+|-------------------------|-------|---------|
+|hbis_member_extract_daily|HBIS   |Extract  |
+|synapse_claims_transform |SYNAPSE|Transform|
+|rds_provider_load        |RDS    |Load     |
+
+Rules:
+
+	•	dag_name must exactly match what is stored in dag_execution_audit.dag_name — spelling, case, underscores all must match
+	•	Save the file somewhere stable — a shared drive or SharePoint is ideal, not your local desktop, because Power BI Service needs to reach it during refresh
+	•	This file only needs updating when a new DAG is added or removed — not daily
+	•	Name the sheet something clean like dag_mapping
+
+Step 2 — Connect Power BI to Your Database (DirectQuery)
+
+Open Power BI Desktop:
+
+	1.	Click Home → Get Data → More
+	2.	Search for your database type — Amazon Redshift or PostgreSQL (RDS Aurora/Postgres) and click Connect
+	3.	Enter your server endpoint, port, and database name
+	4.	For credentials use your DB username and password
+	5.	Critical — when it asks for Data Connectivity Mode, select DirectQuery not Import
+
+If you are on RDS PostgreSQL, use the PostgreSQL connector. If Redshift, use the Amazon Redshift connector. Do not use ODBC as that makes refresh harder later.
+
+Once connected, Power BI will show you the list of tables. Do not load any table directly from this list. We will write our own SQL instead — go to Step 3.
+
+Step 3 — Write and Load the SQL Queries
+
+After connecting, instead of picking a table, click Advanced Options (visible at the bottom of the connection dialog) and paste your SQL there. We need two queries — one for execution data and one for schedule.
+
+Query 1 — DAG Execution (today only)
+
+SELECT
+    dag_name,
+    dag_execution_id,
+    dag_start_time,
+    dag_end_time,
+    dag_status,
+    CASE
+        WHEN dag_status = 'completed'   THEN 'Completed'
+        WHEN dag_status = 'failed'      THEN 'Failed'
+        WHEN dag_status = 'in progress' THEN 'Running'
+        ELSE dag_status
+    END AS status_label,
+    EXTRACT(EPOCH FROM (
+        COALESCE(dag_end_time, NOW()) - dag_start_time
+    )) / 60.0 AS duration_minutes,
+    CAST(dag_start_time AS DATE) AS run_date
+FROM dag_execution_audit
+WHERE CAST(dag_start_time AS DATE) = CURRENT_DATE
+
+
+Name this query dag_execution_today in Power BI.
+
+Query 2 — DAG Schedule
+
+SELECT
+    dag_name,
+    schedule,
+    schedule_desc
+FROM dag_schedule
+
+
+Name this query dag_schedule in Power BI.
+
+Both queries stay as DirectQuery — every time the report refreshes it runs these exact SQLs against your live database.
+
+Step 4 — Load the Excel File
+
+	1.	In Power BI Desktop go to Home → Get Data → Excel Workbook
+	2.	Browse to your Excel file and select it
+	3.	Select the sheet dag_mapping and click Load
+	4.	This will load in Import mode — this is expected and correct
+	5.	Name this query dag_mapping in Power BI
+
+Your model now has three tables:
+
+	•	dag_execution_today — DirectQuery (live)
+	•	dag_schedule — DirectQuery (live)
+	•	dag_mapping — Import (static, refreshes only when Excel changes)
+
+This combination is called a Composite Model in Power BI and is fully supported.
+
+Step 5 — Build the Data Model (Relationships)
+
+Go to Model view (the icon that looks like three connected boxes on the left sidebar).
+
+You need to create two relationships:
+
+Relationship 1
+
+	•	From: dag_mapping[dag_name]
+	•	To: dag_execution_today[dag_name]
+	•	Cardinality: One to Many (one DAG in Excel → many runs in audit table)
+	•	Cross filter direction: Single
+	•	This is the key relationship — it ensures Not Started DAGs from Excel appear in visuals even when they have no row in the DB
+
+Relationship 2
+
+	•	From: dag_mapping[dag_name]
+	•	To: dag_schedule[dag_name]
+	•	Cardinality: One to One
+	•	Cross filter direction: Single
+Always drive relationships from dag_mapping outward. The Excel table is your master list — it controls which DAGs appear on the dashboard.
+
+Step 6 — Write the DAX Measures
+
+Go to Report view, click on the dag_mapping table in the Fields pane, then click New Measure for each of these.
+
+Total DAGs
+
+Total DAGs = COUNTROWS(dag_mapping)
+
+
+Completed
+
+Completed = 
+CALCULATE(
+    COUNTROWS(dag_execution_today),
+    dag_execution_today[status_label] = "Completed"
+)
+
+
+Failed
+
+Failed = 
+CALCULATE(
+    COUNTROWS(dag_execution_today),
+    dag_execution_today[status_label] = "Failed"
+)
+
+
+Running
+
+Running = 
+CALCULATE(
+    COUNTROWS(dag_execution_today),
+    dag_execution_today[status_label] = "Running"
+)
+
+
+Not Started
+
+Not Started = 
+CALCULATE(
+    COUNTROWS(dag_mapping),
+    ISBLANK(
+        CALCULATE(COUNTROWS(dag_execution_today))
+    )
+)
+
+
+The Not Started measure works because of the LEFT JOIN nature of the relationship — DAGs in Excel with no matching row in dag_execution_today for today will return BLANK when counted, and we catch those with ISBLANK.
+
+That covers the full data foundation. Ready to move to Steps 7 to 13 — building the visuals?
