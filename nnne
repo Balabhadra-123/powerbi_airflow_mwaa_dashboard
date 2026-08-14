@@ -1,0 +1,554 @@
+CREATE OR REPLACE VIEW job_audit.vw_daily_dashboard_pbi AS
+
+WITH inventory AS
+(
+    SELECT
+        dag_name,
+        source_system,
+        dag_type,
+        frequency,
+        scheduling_type,
+        dashboard_group,
+        master_dag_name
+    FROM job_audit.dag_inventory_pbi
+    WHERE frequency = 'Daily'
+      AND dashboard_group IN ('Operational', 'Both')
+),
+
+latest_execution AS
+(
+    SELECT
+        dea.dag_execution_id,
+        dea.dag_name,
+        dea.dag_status,
+        dea.dag_start_time,
+        dea.dag_end_time,
+
+        ROW_NUMBER() OVER
+        (
+            PARTITION BY dea.dag_name
+            ORDER BY dea.dag_start_time DESC
+        ) AS rn
+
+    FROM job_audit.dag_execution_audit dea
+
+    WHERE
+        (
+            dea.dag_start_time AT TIME ZONE 'UTC'
+            AT TIME ZONE 'Australia/Melbourne'
+        )::date
+        =
+        (
+            CURRENT_TIMESTAMP
+            AT TIME ZONE 'Australia/Melbourne'
+        )::date
+),
+
+/* ============================================================
+   BASE DATA
+   This is essentially your existing view logic.
+   One row per actual Daily DAG.
+   ============================================================ */
+
+base_data AS
+(
+    SELECT
+
+        /* ----------------------------------------------------
+           Display / Hierarchy
+           ---------------------------------------------------- */
+
+        CASE
+            WHEN inv.master_dag_name IS NOT NULL
+                THEN inv.master_dag_name
+            ELSE inv.dag_name
+        END AS display_parent,
+
+        CASE
+            WHEN inv.master_dag_name IS NOT NULL
+                THEN inv.dag_name
+            ELSE NULL
+        END AS display_child,
+
+        CASE
+            WHEN inv.master_dag_name IS NULL
+                THEN 1
+            ELSE 2
+        END AS display_order,
+
+        /* ----------------------------------------------------
+           Inventory Details
+           ---------------------------------------------------- */
+
+        inv.dag_name,
+        inv.source_system,
+        inv.dag_type,
+        inv.frequency,
+        inv.scheduling_type,
+        inv.dashboard_group,
+        inv.master_dag_name,
+
+        /* ----------------------------------------------------
+           Schedule Details
+           ---------------------------------------------------- */
+
+        sch.is_paused,
+        sch.schedule_interval,
+        sch.timetable_description,
+        sch.last_run_time,
+        sch.next_run_time,
+
+        /* ----------------------------------------------------
+           Execution Details
+           ---------------------------------------------------- */
+
+        le.dag_execution_id,
+
+        CASE
+            WHEN le.dag_name IS NULL
+                THEN 'NOT_STARTED'
+
+            WHEN UPPER(le.dag_status) IN
+                 ('STARTED', 'RUNNING', 'IN_PROGRESS')
+                THEN 'STARTED'
+
+            ELSE UPPER(le.dag_status)
+        END AS dag_status,
+
+        le.dag_start_time,
+        le.dag_end_time,
+
+        CASE
+            WHEN le.dag_start_time IS NOT NULL
+             AND le.dag_end_time IS NOT NULL
+            THEN ROUND
+            (
+                EXTRACT
+                (
+                    EPOCH FROM
+                    (
+                        le.dag_end_time
+                        - le.dag_start_time
+                    )
+                ) / 60.0,
+                2
+            )
+
+            WHEN le.dag_start_time IS NOT NULL
+             AND le.dag_end_time IS NULL
+            THEN ROUND
+            (
+                EXTRACT
+                (
+                    EPOCH FROM
+                    (
+                        CURRENT_TIMESTAMP
+                        - le.dag_start_time
+                    )
+                ) / 60.0,
+                2
+            )
+
+            ELSE NULL
+        END AS duration_minutes,
+
+        /* ----------------------------------------------------
+           KPI Flags
+           ---------------------------------------------------- */
+
+        CASE
+            WHEN le.dag_name IS NULL
+                THEN 0
+            ELSE 1
+        END AS is_started,
+
+        CASE
+            WHEN UPPER(COALESCE(le.dag_status, '')) = 'COMPLETED'
+                THEN 1
+            ELSE 0
+        END AS is_completed,
+
+        CASE
+            WHEN UPPER(COALESCE(le.dag_status, '')) = 'FAILED'
+                THEN 1
+            ELSE 0
+        END AS is_failed,
+
+        CASE
+            WHEN UPPER(COALESCE(le.dag_status, ''))
+                 IN ('STARTED', 'RUNNING', 'IN_PROGRESS')
+                THEN 1
+            ELSE 0
+        END AS is_running,
+
+        CASE
+            WHEN le.dag_name IS NULL
+                THEN 1
+            ELSE 0
+        END AS is_not_started
+
+    FROM inventory inv
+
+    LEFT JOIN latest_execution le
+        ON inv.dag_name = le.dag_name
+       AND le.rn = 1
+
+    LEFT JOIN job_audit.dag_schedule_audit sch
+        ON inv.dag_name = sch.dag_id
+),
+
+/* ============================================================
+   MASTER SUMMARY
+   One calculated row per Master DAG.
+
+   IMPORTANT:
+   The master itself does NOT exist in dag_execution_audit.
+   Its status is calculated from its child DAGs.
+   ============================================================ */
+
+master_summary AS
+(
+    SELECT
+
+        bd.master_dag_name,
+
+        /* ----------------------------------------------------
+           MASTER STATUS
+
+           Priority:
+           FAILED
+           STARTED
+           NOT_STARTED
+           COMPLETED
+           ---------------------------------------------------- */
+
+        CASE
+
+            WHEN COUNT(*) FILTER
+            (
+                WHERE bd.dag_status = 'FAILED'
+            ) > 0
+                THEN 'FAILED'
+
+            WHEN COUNT(*) FILTER
+            (
+                WHERE bd.dag_status = 'STARTED'
+            ) > 0
+                THEN 'STARTED'
+
+            WHEN COUNT(*) FILTER
+            (
+                WHERE bd.dag_status = 'NOT_STARTED'
+            ) > 0
+                THEN 'NOT_STARTED'
+
+            WHEN COUNT(*) FILTER
+            (
+                WHERE bd.dag_status = 'COMPLETED'
+            ) = COUNT(*)
+                THEN 'COMPLETED'
+
+            ELSE 'NOT_STARTED'
+
+        END AS dag_status,
+
+        /* ----------------------------------------------------
+           MASTER START TIME
+           Earliest child start
+           ---------------------------------------------------- */
+
+        MIN(bd.dag_start_time) AS dag_start_time,
+
+        /* ----------------------------------------------------
+           MASTER END TIME
+           Only populated when all children are completed.
+           ---------------------------------------------------- */
+
+        CASE
+            WHEN COUNT(*) FILTER
+            (
+                WHERE bd.dag_status <> 'COMPLETED'
+            ) = 0
+
+            THEN MAX(bd.dag_end_time)
+
+            ELSE NULL
+        END AS dag_end_time,
+
+        /* ----------------------------------------------------
+           MASTER DURATION
+           ---------------------------------------------------- */
+
+        CASE
+
+            WHEN COUNT(*) FILTER
+            (
+                WHERE bd.dag_status = 'COMPLETED'
+            ) = COUNT(*)
+
+            THEN ROUND
+            (
+                EXTRACT
+                (
+                    EPOCH FROM
+                    (
+                        MAX(bd.dag_end_time)
+                        - MIN(bd.dag_start_time)
+                    )
+                ) / 60.0,
+                2
+            )
+
+            WHEN MIN(bd.dag_start_time) IS NOT NULL
+
+            THEN ROUND
+            (
+                EXTRACT
+                (
+                    EPOCH FROM
+                    (
+                        CURRENT_TIMESTAMP
+                        - MIN(bd.dag_start_time)
+                    )
+                ) / 60.0,
+                2
+            )
+
+            ELSE NULL
+
+        END AS duration_minutes,
+
+        /* ----------------------------------------------------
+           Source System
+           ---------------------------------------------------- */
+
+        CASE
+            WHEN COUNT(DISTINCT bd.source_system) = 1
+                THEN MIN(bd.source_system)
+            ELSE 'Multiple'
+        END AS source_system,
+
+        /* ----------------------------------------------------
+           DAG Type
+           ---------------------------------------------------- */
+
+        CASE
+            WHEN COUNT(DISTINCT bd.dag_type) = 1
+                THEN MIN(bd.dag_type)
+            ELSE 'Multiple'
+        END AS dag_type,
+
+        /* ----------------------------------------------------
+           Child Counts
+           ---------------------------------------------------- */
+
+        COUNT(*) AS child_dag_count,
+
+        COUNT(*) FILTER
+        (
+            WHERE bd.dag_status = 'COMPLETED'
+        ) AS completed_child_count,
+
+        COUNT(*) FILTER
+        (
+            WHERE bd.dag_status = 'FAILED'
+        ) AS failed_child_count,
+
+        COUNT(*) FILTER
+        (
+            WHERE bd.dag_status = 'STARTED'
+        ) AS started_child_count,
+
+        COUNT(*) FILTER
+        (
+            WHERE bd.dag_status = 'NOT_STARTED'
+        ) AS not_started_child_count
+
+    FROM base_data bd
+
+    WHERE bd.master_dag_name IS NOT NULL
+
+    GROUP BY
+        bd.master_dag_name
+)
+
+/* ============================================================
+   FINAL RESULT
+   ============================================================ */
+
+/* ------------------------------------------------------------
+   1. NORMAL + CHILD DAG ROWS
+   ------------------------------------------------------------ */
+
+SELECT
+
+    CASE
+        WHEN bd.master_dag_name IS NULL
+            THEN 'NORMAL'
+        ELSE 'CHILD'
+    END AS row_type,
+
+    bd.display_parent,
+    bd.display_child,
+    bd.display_order,
+
+    bd.dag_name,
+    bd.source_system,
+    bd.dag_type,
+    bd.frequency,
+    bd.scheduling_type,
+    bd.dashboard_group,
+    bd.master_dag_name,
+
+    bd.is_paused,
+    bd.schedule_interval,
+    bd.timetable_description,
+    bd.last_run_time,
+    bd.next_run_time,
+
+    bd.dag_execution_id,
+    bd.dag_status,
+
+    /* Status sorting */
+    CASE
+        WHEN bd.dag_status = 'FAILED'
+            THEN 1
+
+        WHEN bd.dag_status = 'STARTED'
+            THEN 2
+
+        WHEN bd.dag_status = 'NOT_STARTED'
+            THEN 3
+
+        WHEN bd.dag_status = 'COMPLETED'
+            THEN 4
+
+        ELSE 99
+    END AS status_sort,
+
+    bd.dag_start_time,
+    bd.dag_end_time,
+    bd.duration_minutes,
+
+    /* Actual DAG = 1 */
+    1 AS is_actual_dag,
+
+    bd.is_started,
+    bd.is_completed,
+    bd.is_failed,
+    bd.is_running,
+    bd.is_not_started,
+
+    NULL::INTEGER AS child_dag_count,
+    NULL::INTEGER AS completed_child_count,
+    NULL::INTEGER AS failed_child_count,
+    NULL::INTEGER AS started_child_count,
+    NULL::INTEGER AS not_started_child_count,
+
+    2 AS hierarchy_sort
+
+FROM base_data bd
+
+
+UNION ALL
+
+
+/* ------------------------------------------------------------
+   2. MASTER WORKFLOW SUMMARY ROW
+   ------------------------------------------------------------ */
+
+SELECT
+
+    'MASTER' AS row_type,
+
+    ms.master_dag_name AS display_parent,
+
+    NULL AS display_child,
+
+    1 AS display_order,
+
+    ms.master_dag_name AS dag_name,
+
+    ms.source_system,
+    ms.dag_type,
+
+    'Daily' AS frequency,
+
+    'MASTER' AS scheduling_type,
+
+    'Operational' AS dashboard_group,
+
+    NULL AS master_dag_name,
+
+    NULL AS is_paused,
+    NULL AS schedule_interval,
+    NULL AS timetable_description,
+    NULL AS last_run_time,
+    NULL AS next_run_time,
+
+    NULL AS dag_execution_id,
+
+    ms.dag_status,
+
+    CASE
+        WHEN ms.dag_status = 'FAILED'
+            THEN 1
+
+        WHEN ms.dag_status = 'STARTED'
+            THEN 2
+
+        WHEN ms.dag_status = 'NOT_STARTED'
+            THEN 3
+
+        WHEN ms.dag_status = 'COMPLETED'
+            THEN 4
+
+        ELSE 99
+    END AS status_sort,
+
+    ms.dag_start_time,
+    ms.dag_end_time,
+    ms.duration_minutes,
+
+    /* Master is NOT an actual DAG execution */
+    0 AS is_actual_dag,
+
+    CASE
+        WHEN ms.dag_status <> 'NOT_STARTED'
+            THEN 1
+        ELSE 0
+    END AS is_started,
+
+    CASE
+        WHEN ms.dag_status = 'COMPLETED'
+            THEN 1
+        ELSE 0
+    END AS is_completed,
+
+    CASE
+        WHEN ms.dag_status = 'FAILED'
+            THEN 1
+        ELSE 0
+    END AS is_failed,
+
+    CASE
+        WHEN ms.dag_status = 'STARTED'
+            THEN 1
+        ELSE 0
+    END AS is_running,
+
+    CASE
+        WHEN ms.dag_status = 'NOT_STARTED'
+            THEN 1
+        ELSE 0
+    END AS is_not_started,
+
+    ms.child_dag_count,
+    ms.completed_child_count,
+    ms.failed_child_count,
+    ms.started_child_count,
+    ms.not_started_child_count,
+
+    1 AS hierarchy_sort
+
+FROM master_summary ms;
