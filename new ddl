@@ -1,0 +1,489 @@
+CREATE OR REPLACE VIEW job_audit.vw_periodic_dashboard_pbi AS
+
+WITH inventory AS
+(
+    SELECT
+        dag_name,
+        source_system,
+        dag_type,
+        frequency,
+        scheduling_type,
+        dashboard_group,
+        master_dag_name
+    FROM job_audit.dag_inventory_pbi
+    WHERE frequency <> 'Daily'
+      AND dashboard_group IN ('Periodic', 'Both')
+),
+
+/* ============================================================
+   LATEST EXECUTION FOR EACH PERIODIC DAG
+   ============================================================ */
+
+latest_execution AS
+(
+    SELECT
+        dea.dag_execution_id,
+        dea.dag_name,
+        UPPER(dea.dag_status) AS dag_status,
+
+        (
+            dea.dag_start_time
+            AT TIME ZONE 'UTC'
+            AT TIME ZONE 'Australia/Melbourne'
+        ) AS dag_start_time,
+
+        (
+            dea.dag_end_time
+            AT TIME ZONE 'UTC'
+            AT TIME ZONE 'Australia/Melbourne'
+        ) AS dag_end_time,
+
+        ROW_NUMBER() OVER
+        (
+            PARTITION BY dea.dag_name
+            ORDER BY dea.dag_start_time DESC
+        ) AS rn
+
+    FROM job_audit.dag_execution_audit dea
+),
+
+/* ============================================================
+   SCHEDULE INFORMATION
+   ============================================================ */
+
+schedule_data AS
+(
+    SELECT
+        sch.dag_id,
+        sch.is_paused,
+        sch.schedule_interval,
+        sch.timetable_description,
+        sch.last_run_time,
+        sch.next_run_time
+    FROM job_audit.dag_schedule_audit sch
+),
+
+/* ============================================================
+   BRANCH MAPPING
+   ============================================================ */
+
+branch_data AS
+(
+    SELECT
+        master_dag_name,
+        execution_branch,
+        branch_priority,
+        dag_name
+    FROM job_audit.dag_branch_mapping_pbi
+),
+
+/* ============================================================
+   BASE DATA
+   ============================================================ */
+
+base_data AS
+(
+    SELECT
+
+        inv.dag_name,
+        inv.source_system,
+        inv.dag_type,
+        inv.frequency,
+        inv.scheduling_type,
+        inv.dashboard_group,
+        inv.master_dag_name,
+
+        bd.execution_branch,
+        bd.branch_priority,
+
+        sch.is_paused,
+        sch.schedule_interval,
+        sch.timetable_description,
+        sch.last_run_time,
+        sch.next_run_time,
+
+        le.dag_execution_id,
+        le.dag_status,
+        le.dag_start_time,
+        le.dag_end_time,
+
+        /* ----------------------------------------------------
+           Latest execution duration
+           ---------------------------------------------------- */
+
+        CASE
+            WHEN le.dag_start_time IS NOT NULL
+             AND le.dag_end_time IS NOT NULL
+            THEN
+                ROUND(
+                    EXTRACT(
+                        EPOCH FROM
+                        (
+                            le.dag_end_time
+                            - le.dag_start_time
+                        )
+                    ) / 60.0,
+                    2
+                )
+
+            WHEN le.dag_start_time IS NOT NULL
+             AND le.dag_end_time IS NULL
+            THEN
+                ROUND(
+                    EXTRACT(
+                        EPOCH FROM
+                        (
+                            (
+                                CURRENT_TIMESTAMP
+                                AT TIME ZONE 'Australia/Melbourne'
+                            )::timestamp
+                            - le.dag_start_time
+                        )
+                    ) / 60.0,
+                    2
+                )
+
+            ELSE NULL
+        END AS duration_minutes
+
+    FROM inventory inv
+
+    LEFT JOIN branch_data bd
+        ON inv.dag_name = bd.dag_name
+       AND inv.master_dag_name = bd.master_dag_name
+
+    LEFT JOIN schedule_data sch
+        ON inv.dag_name = sch.dag_id
+
+    LEFT JOIN latest_execution le
+        ON inv.dag_name = le.dag_name
+       AND le.rn = 1
+),
+
+/* ============================================================
+   EXPECTED RUN DATE
+   ============================================================ */
+
+expected_dates AS
+(
+    SELECT
+        bd.*,
+
+        CASE
+
+            /* ------------------------------------------------
+               MASTER / BRANCH : SECOND DAY
+               ------------------------------------------------ */
+
+            WHEN UPPER(COALESCE(bd.execution_branch, ''))
+                 = 'SECOND_DAY'
+
+            THEN
+                CASE
+                    WHEN EXTRACT(
+                        DAY FROM
+                        (
+                            CURRENT_DATE
+                        )
+                    ) < 2
+                    THEN
+                        DATE_TRUNC(
+                            'month',
+                            CURRENT_DATE
+                        )::date
+                        + INTERVAL '1 day'
+
+                    ELSE
+                        (
+                            DATE_TRUNC(
+                                'month',
+                                CURRENT_DATE
+                            )
+                            + INTERVAL '1 month'
+                            + INTERVAL '1 day'
+                        )::date
+                END
+
+            /* ------------------------------------------------
+               MASTER / BRANCH : FIRST DAY
+               ------------------------------------------------ */
+
+            WHEN UPPER(COALESCE(bd.execution_branch, ''))
+                 = 'FIRST_DAY'
+
+            THEN
+                CASE
+                    WHEN EXTRACT(
+                        DAY FROM CURRENT_DATE
+                    ) < 1
+                    THEN CURRENT_DATE
+                    ELSE
+                        (
+                            DATE_TRUNC(
+                                'month',
+                                CURRENT_DATE
+                            )
+                            + INTERVAL '1 month'
+                        )::date
+                END
+
+            /* ------------------------------------------------
+               MASTER / BRANCH : WEDNESDAY
+               ------------------------------------------------ */
+
+            WHEN UPPER(COALESCE(bd.execution_branch, ''))
+                 = 'WEDNESDAY'
+
+            THEN
+                (
+                    CURRENT_DATE
+                    +
+                    (
+                        (
+                            3
+                            -
+                            EXTRACT(
+                                DOW FROM CURRENT_DATE
+                            )::integer
+                            + 7
+                        ) % 7
+                    )
+                )::date
+
+            /* ------------------------------------------------
+               NORMAL WEEKLY DAG
+               Use Airflow next_run_time
+               ------------------------------------------------ */
+
+            WHEN UPPER(COALESCE(bd.frequency, ''))
+                 = 'WEEKLY'
+
+            THEN
+                bd.next_run_time::date
+
+            /* ------------------------------------------------
+               NORMAL MONTHLY DAG
+               Use Airflow next_run_time
+               ------------------------------------------------ */
+
+            WHEN UPPER(COALESCE(bd.frequency, ''))
+                 = 'MONTHLY'
+
+            THEN
+                bd.next_run_time::date
+
+            /* ------------------------------------------------
+               NORMAL QUARTERLY DAG
+               Use Airflow next_run_time
+               ------------------------------------------------ */
+
+            WHEN UPPER(COALESCE(bd.frequency, ''))
+                 = 'QUARTERLY'
+
+            THEN
+                bd.next_run_time::date
+
+            ELSE
+                bd.next_run_time::date
+
+        END AS expected_run_date
+
+    FROM base_data bd
+),
+
+/* ============================================================
+   CURRENT CYCLE STATUS
+   ============================================================ */
+
+final_data AS
+(
+    SELECT
+        ed.*,
+
+        CASE
+
+            /* -----------------------------------------------
+               No expected date available
+               ----------------------------------------------- */
+
+            WHEN ed.expected_run_date IS NULL
+            THEN 'WAITING FOR NEXT CYCLE'
+
+            /* -----------------------------------------------
+               Latest execution failed
+               ----------------------------------------------- */
+
+            WHEN ed.dag_status = 'FAILED'
+            THEN 'FAILED'
+
+            /* -----------------------------------------------
+               Currently running
+               ----------------------------------------------- */
+
+            WHEN ed.dag_status IN
+                 ('STARTED', 'RUNNING', 'IN_PROGRESS')
+            THEN 'IN PROGRESS'
+
+            /* -----------------------------------------------
+               Expected today/past but no execution
+               ----------------------------------------------- */
+
+            WHEN ed.expected_run_date <= CURRENT_DATE
+             AND ed.dag_start_time IS NULL
+            THEN 'NOT STARTED'
+
+            /* -----------------------------------------------
+               Latest execution completed
+               ----------------------------------------------- */
+
+            WHEN ed.dag_status = 'COMPLETED'
+            THEN 'COMPLETED'
+
+            /* -----------------------------------------------
+               Future expected run
+               ----------------------------------------------- */
+
+            WHEN ed.expected_run_date > CURRENT_DATE
+            THEN 'WAITING FOR NEXT CYCLE'
+
+            ELSE
+                'WAITING FOR NEXT CYCLE'
+
+        END AS current_cycle_status
+
+    FROM expected_dates ed
+)
+
+SELECT
+
+    /* ========================================================
+       IDENTIFICATION
+       ======================================================== */
+
+    dag_name,
+
+    master_dag_name,
+
+    execution_branch,
+
+    branch_priority,
+
+    source_system,
+
+    dag_type,
+
+    frequency,
+
+    scheduling_type,
+
+    dashboard_group,
+
+    /* ========================================================
+       SCHEDULE
+       ======================================================== */
+
+    is_paused,
+
+    schedule_interval,
+
+    timetable_description,
+
+    last_run_time,
+
+    next_run_time,
+
+    expected_run_date,
+
+    /* ========================================================
+       EXECUTION
+       ======================================================== */
+
+    dag_execution_id,
+
+    dag_status AS last_status,
+
+    dag_start_time,
+
+    dag_end_time,
+
+    duration_minutes,
+
+    current_cycle_status,
+
+    /* ========================================================
+       STATUS SORT
+       ======================================================== */
+
+    CASE
+        WHEN current_cycle_status = 'FAILED'
+            THEN 1
+
+        WHEN current_cycle_status = 'IN PROGRESS'
+            THEN 2
+
+        WHEN current_cycle_status = 'NOT STARTED'
+            THEN 3
+
+        WHEN current_cycle_status = 'COMPLETED'
+            THEN 4
+
+        WHEN current_cycle_status = 'WAITING FOR NEXT CYCLE'
+            THEN 5
+
+        ELSE 99
+    END AS status_sort,
+
+    /* ========================================================
+       KPI FLAGS
+       ======================================================== */
+
+    CASE
+        WHEN current_cycle_status <> 'WAITING FOR NEXT CYCLE'
+        THEN 1
+        ELSE 0
+    END AS is_expected,
+
+    CASE
+        WHEN current_cycle_status = 'COMPLETED'
+        THEN 1
+        ELSE 0
+    END AS is_completed,
+
+    CASE
+        WHEN current_cycle_status = 'FAILED'
+        THEN 1
+        ELSE 0
+    END AS is_failed,
+
+    CASE
+        WHEN current_cycle_status = 'IN PROGRESS'
+        THEN 1
+        ELSE 0
+    END AS is_in_progress,
+
+    CASE
+        WHEN current_cycle_status = 'NOT STARTED'
+        THEN 1
+        ELSE 0
+    END AS is_not_started,
+
+    CASE
+        WHEN current_cycle_status = 'WAITING FOR NEXT CYCLE'
+        THEN 1
+        ELSE 0
+    END AS is_waiting_next_cycle,
+
+    CASE
+        WHEN master_dag_name IS NOT NULL
+        THEN 1
+        ELSE 0
+    END AS is_master_child
+
+FROM final_data
+
+ORDER BY
+    status_sort,
+    source_system,
+    frequency,
+    master_dag_name,
+    dag_name;
