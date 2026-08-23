@@ -1,0 +1,1339 @@
+============================================================
+PROJECT: AIRFLOW / MWAA POWER BI MONITORING DASHBOARD
+PERIODIC DASHBOARD
+============================================================
+
+I am building a Power BI monitoring dashboard for Airflow/MWAA DAGs.
+
+The Daily DAG monitoring page has already been developed and is working.
+
+I am now designing the SECOND PAGE:
+
+                    PERIODIC DAG MONITORING
+
+I want you to understand the complete data model, metadata, business rules,
+constraints and requirements before proposing any SQL, DAX or Power BI design.
+
+Do NOT assume the previous Daily page solution should be reused blindly.
+
+============================================================
+1. OVERALL OBJECTIVE
+============================================================
+
+The Power BI dashboard monitors Airflow/MWAA DAG execution from an
+operational/support perspective.
+
+There are two major categories:
+
+1. Daily / operational DAGs
+2. Periodic DAGs
+
+The Daily page is already working.
+
+The current task is ONLY the Periodic Dashboard.
+
+The Periodic Dashboard needs to monitor DAGs that run on schedules such as:
+
+- Weekly
+- Monthly
+- Quarterly
+- Other periodic schedules
+- DAGs triggered through Master DAG branch logic
+
+The primary purpose of the Periodic Dashboard is to answer:
+
+"For each periodic DAG, what is its expected execution cycle, when did it
+last run, what is its current status for the relevant cycle, and when is
+the next expected cycle?"
+
+============================================================
+2. POWER BI CONNECTION
+============================================================
+
+Power BI uses:
+
+DIRECTQUERY
+
+I prefer SQL-based business logic where practical rather than creating
+large numbers of complicated DAX measures.
+
+The database is PostgreSQL.
+
+The dashboard should remain suitable for DirectQuery performance.
+
+The metadata tables are manually maintained.
+
+There is no requirement to dynamically discover all business scheduling
+rules from Airflow if they are not available.
+
+Manual maintenance of metadata is acceptable.
+
+============================================================
+3. EXISTING TABLE: DAG EXECUTION AUDIT
+============================================================
+
+Table:
+
+job_audit.dag_execution_audit
+
+This is an existing production table.
+
+Columns include:
+
+- dag_execution_id
+    UUID
+
+- dag_name
+    character varying
+
+- dag_global_config
+    JSON
+
+- dag_local_config
+    JSON
+
+- etl_config
+    JSON
+
+- dag_status
+    character varying
+
+- dag_start_time
+    timestamp without time zone
+
+- dag_end_time
+    timestamp without time zone
+
+
+Important fields for this project:
+
+dag_execution_id
+dag_name
+dag_status
+dag_start_time
+dag_end_time
+
+
+Known execution statuses include:
+
+- COMPLETED
+- STARTED
+- FAILED
+
+The actual audit table may contain multiple executions for the same DAG.
+
+For example, a DAG can run:
+
+08:00 FAILED
+10:00 FAILED
+12:00 COMPLETED
+
+because of:
+
+- failure/retry
+- catch-up processing
+- backfill
+- manual rerun
+- operational rerun
+
+Therefore, the latest relevant execution needs to be identified when determining
+the current state.
+
+Execution timestamps are stored in UTC.
+
+The operational dashboard uses:
+
+Australia/Melbourne
+
+timezone.
+
+============================================================
+4. EXISTING TABLE: DAG SCHEDULE AUDIT
+============================================================
+
+Table:
+
+job_audit.dag_schedule_audit
+
+Columns:
+
+- dag_id
+    character varying
+
+- is_paused
+    boolean
+
+- schedule_interval
+    character varying
+
+- timetable_description
+    character varying
+
+- last_run_time
+    timestamp with time zone
+
+- next_run_time
+    timestamp with time zone
+
+
+This table contains Airflow/MWAA scheduling information.
+
+Important:
+
+Some DAGs have a normal Airflow schedule.
+
+Some DAGs have:
+
+schedule = None
+
+because they are triggered by a Master DAG.
+
+For normally scheduled DAGs, Airflow/MWAA may provide useful:
+
+- last_run_time
+- next_run_time
+
+For Master-triggered DAGs, this information may not be sufficient because
+the child DAG itself does not necessarily have an independent schedule.
+
+============================================================
+5. NEW METADATA TABLE 1
+============================================================
+
+Table:
+
+job_audit.dag_inventory_pbi
+
+This is a manually maintained metadata table created specifically for
+Power BI reporting.
+
+Current columns:
+
+- dag_name
+- source_system
+- dag_type
+- frequency
+- scheduling_type
+- master_dag_name
+- dashboard_group
+
+
+The purpose of this table is to provide business/reporting metadata that
+cannot reliably be obtained from the execution audit.
+
+============================================================
+6. CURRENT METADATA VALUES
+============================================================
+
+The manually populated inventory contains periodic DAGs belonging to
+different source systems.
+
+Examples visible in the current metadata include:
+
+Source system:
+
+Enterprise Information
+
+Examples of DAGs include:
+
+- mmm_dm_ageomifact_sensitive_DM
+- mmm_dm_aging_DM
+- mmm_dm_gainsuperresomat_sensitive_DM
+- mmm_dm_inforce_conso_Periodic
+- mmm_dm_inforce_conso_sensitive_DM
+- mmm_dm_inforce_consolidated_master_dag
+- mmm_dm_phl_eom_WW_sensitive_DM
+- mmm_dm_phl_intotld_lat_din_DM
+- mmm_dm_phl_pnq_eom_WW_sensitive_DM
+- mmm_dm_phl_pymnt_on_acct_base_DM
+- mmm_dm_phl_pymnt_on_acct_base_hst_DM
+- mmm_dm_phl_rec_base_DM
+- mmm_dm_phl_rec_base_hst_DM
+- mmm_dm_phl_... sensitive DM jobs
+- other Enterprise Information periodic DAGs
+
+Other source systems include:
+
+MERR
+
+Examples visible:
+
+- oscar_cd_contributions_LRA
+- oscar_mer_base_master_dag
+- oscar_mer_base_periodic
+- mer_dm_healthcheck_error_rpt_EXT
+- other MER-related DAGs
+
+
+The actual metadata table contains approximately 30+ periodic rows in the
+current test dataset.
+
+The metadata was manually inserted for development/testing.
+
+============================================================
+7. FREQUENCY VALUES
+============================================================
+
+The metadata contains frequencies such as:
+
+- Daily
+- Weekly
+- Monthly
+- Mixed
+
+For the Periodic Dashboard, the primary relevant categories are:
+
+- Weekly
+- Monthly
+- Quarterly
+- other periodic schedules
+
+Frequency is descriptive metadata.
+
+IMPORTANT:
+
+Do NOT assume that frequency alone is sufficient to determine whether
+a DAG is expected to run today.
+
+The actual expected execution may depend on:
+
+- Airflow schedule
+- timetable
+- Master DAG
+- branch condition
+- day of month
+- day of week
+- branch priority
+- manually maintained business rules
+
+============================================================
+8. SCHEDULING TYPE VALUES
+============================================================
+
+The metadata currently uses values such as:
+
+MASTER
+BRANCH
+
+There are also normal scheduled DAGs.
+
+The meaning is:
+
+MASTER:
+The DAG/workflow is associated with a Master DAG.
+
+BRANCH:
+The execution is controlled through a branch of a Master DAG.
+
+Some periodic DAGs are directly scheduled.
+
+Others are triggered by Master DAG logic.
+
+============================================================
+9. DASHBOARD GROUP
+============================================================
+
+The inventory has:
+
+dashboard_group
+
+Values include:
+
+- Operational
+- Periodic
+- Both
+
+For this Periodic Dashboard, the relevant records are the ones intended
+for:
+
+Periodic
+or
+Both
+
+Daily-only operational DAGs should not appear simply because they exist
+in the inventory.
+
+============================================================
+10. MASTER DAG CONCEPT
+============================================================
+
+Some DAGs are triggered by a Master DAG.
+
+The Master DAG itself may not have a corresponding execution record in:
+
+job_audit.dag_execution_audit
+
+The execution audit primarily contains the child DAG information.
+
+Example:
+
+Master:
+
+Oscar Master
+
+Children may include:
+
+- oscar_cd_contributions_LRA
+- mer_dm_healthcheck_errors_DM
+- other child DAGs
+
+
+Another Master workflow exists around:
+
+mmm_dm_inforce_consolidated_master_dag
+
+with multiple child DAGs.
+
+============================================================
+11. MASTER DAG BRANCHING
+============================================================
+
+Some Master DAGs have conditional branching.
+
+There are approximately:
+
+- Maximum around 10 Master DAGs
+- Around 300 child DAGs overall
+- Only approximately 3-4 Master DAGs currently have complex branch
+  decision logic
+
+Manual maintenance is acceptable.
+
+Example:
+
+Oscar Master can have branches such as:
+
+FIRST_DAY
+SECOND_DAY
+WEDNESDAY
+
+The Master DAG has conditional logic.
+
+The branch priority matters.
+
+A representative logical priority is:
+
+1. SECOND_DAY
+2. WEDNESDAY
+3. FIRST_DAY / DAILY
+
+This means if conditions overlap, the actual Master DAG logic determines
+which branch is selected.
+
+Example:
+
+If the 2nd day of the month happens to be Wednesday, the Master DAG should
+select the appropriate higher-priority branch rather than executing the
+same child multiple times.
+
+============================================================
+12. NEW METADATA TABLE 2
+============================================================
+
+Table:
+
+job_audit.dag_branch_mapping_pbi
+
+Current columns:
+
+- master_dag_name
+- execution_branch
+- branch_priority
+- dag_name
+
+
+This table maps a Master DAG to its child DAGs and the branch under which
+the child can be executed.
+
+============================================================
+13. CURRENT BRANCH MAPPING DATA
+============================================================
+
+The current manually inserted test data contains approximately 36 rows.
+
+One major example is:
+
+Master DAG:
+
+oscar_mer_base_master_dag
+
+Branches include:
+
+WEDNESDAY
+SECOND_DAY
+FIRST_DAY
+
+Example child:
+
+oscar_cd_contributions_LRA
+
+is mapped to multiple branches.
+
+For example conceptually:
+
+oscar_mer_base_master_dag
+    WEDNESDAY
+        oscar_cd_contributions_LRA
+
+oscar_mer_base_master_dag
+    SECOND_DAY
+        oscar_cd_contributions_LRA
+
+oscar_mer_base_master_dag
+    FIRST_DAY
+        oscar_cd_contributions_LRA
+
+
+Other children include examples such as:
+
+- mer_dm_healthcheck_error_rpt_EXT
+- mer_dm_phl_eom_...
+- mer_dm_phl_pymnt_on_acct_base_DM
+- mer_dm_phl_rec_base_DM
+- mer_dm_phl_rec_base_hst_DM
+- other MERR/Enterprise Information child DAGs
+
+The exact mapping is maintained manually in:
+
+dag_branch_mapping_pbi
+
+============================================================
+14. IMPORTANT BRANCH EXAMPLE
+============================================================
+
+A Master DAG may behave conceptually like:
+
+IF second day of month:
+    trigger Branch A
+
+ELSE IF Wednesday:
+    trigger Branch B
+
+ELSE:
+    trigger Branch C
+
+
+A child can exist in more than one branch.
+
+Example:
+
+oscar_cd_contributions_LRA
+
+can exist in:
+
+- FIRST_DAY
+- WEDNESDAY
+- SECOND_DAY
+
+This does NOT mean it should execute three times.
+
+The branch condition/priority determines which branch is actually selected.
+
+============================================================
+15. PERIODIC DAG TYPES
+============================================================
+
+The Periodic Dashboard needs to accommodate:
+
+A. Normal weekly DAGs
+
+B. Normal monthly DAGs
+
+C. Normal quarterly DAGs
+
+D. Master-triggered periodic DAGs
+
+E. Branch-controlled periodic DAGs
+
+F. DAGs with multiple possible branch conditions
+
+G. DAGs whose next execution is available through Airflow
+
+H. DAGs whose expected execution cannot reliably be determined from
+   Airflow because they are Master-triggered
+
+============================================================
+16. EXAMPLE: MONTHLY DAG
+============================================================
+
+Suppose:
+
+DAG:
+
+job_A
+
+Frequency:
+
+Monthly
+
+Schedule:
+
+2nd day of every month
+
+
+If today is:
+
+1 September
+
+Expected run:
+
+2 September
+
+The DAG should be considered a future expected job.
+
+If today is:
+
+2 September
+
+and there is no execution:
+
+NOT STARTED
+
+If it starts:
+
+IN PROGRESS
+
+If it completes:
+
+COMPLETED
+
+If it fails:
+
+FAILED
+
+After the September cycle is successfully completed, the dashboard should
+not continue to show it as NOT STARTED for the rest of September.
+
+It should eventually be understood as:
+
+WAITING FOR NEXT CYCLE
+
+until the next expected execution cycle.
+
+============================================================
+17. EXAMPLE: WEEKLY DAG
+============================================================
+
+Suppose:
+
+DAG:
+
+job_B
+
+Frequency:
+
+Weekly
+
+Schedule:
+
+Every Wednesday
+
+If today is Monday:
+
+It is not expected to have run yet.
+
+The dashboard should show the appropriate next expected date/cycle.
+
+On Wednesday:
+
+If no execution:
+NOT STARTED
+
+If running:
+IN PROGRESS
+
+If completed:
+COMPLETED
+
+If failed:
+FAILED
+
+After successful completion:
+
+WAITING FOR NEXT CYCLE
+
+until the next Wednesday cycle.
+
+============================================================
+18. EXAMPLE: MASTER BRANCH JOB
+============================================================
+
+Suppose:
+
+Master:
+
+oscar_mer_base_master_dag
+
+Child:
+
+oscar_cd_contributions_LRA
+
+Possible branches:
+
+FIRST_DAY
+WEDNESDAY
+SECOND_DAY
+
+The dashboard must understand that the child is periodic because its
+execution depends on the Master branch.
+
+The child may have:
+
+schedule = None
+
+in Airflow.
+
+Therefore:
+
+Airflow next_run_time may not be enough to determine the next expected
+execution.
+
+The metadata provides the business scheduling information.
+
+============================================================
+19. CURRENT CYCLE CONCEPT
+============================================================
+
+The Periodic Dashboard should focus on the CURRENT EXPECTED CYCLE.
+
+For each periodic DAG, users should be able to understand:
+
+- What is the expected cycle?
+- When is the expected execution?
+- Has it started?
+- Has it completed?
+- Did it fail?
+- Has the expected cycle not arrived yet?
+- Has the current cycle already completed?
+- Is the DAG waiting for the next cycle?
+
+============================================================
+20. REQUIRED BUSINESS STATUSES
+============================================================
+
+The Periodic Dashboard should ideally use simple business-friendly statuses:
+
+COMPLETED
+
+FAILED
+
+IN PROGRESS
+
+NOT STARTED
+
+WAITING FOR NEXT CYCLE
+
+
+Definitions:
+
+COMPLETED:
+The relevant expected cycle has completed successfully.
+
+FAILED:
+The relevant/current execution failed.
+
+IN PROGRESS:
+The relevant execution has started and is still active.
+
+NOT STARTED:
+The DAG is expected for the current cycle, but no execution has started.
+
+WAITING FOR NEXT CYCLE:
+The current expected cycle is complete or the next expected execution
+has not yet arrived.
+
+============================================================
+21. EXPECTED RUN DATE
+============================================================
+
+The Periodic Dashboard needs an important business field:
+
+expected_run_date
+
+This represents the date on which the DAG is expected to execute for the
+relevant cycle.
+
+The source may differ depending on the DAG:
+
+For normal scheduled DAGs:
+Airflow/MWAA schedule information may be used.
+
+For Master/branch DAGs:
+The manually maintained branch metadata/business rules may be required.
+
+The exact implementation should be determined after understanding the
+data and business rules.
+
+============================================================
+22. LAST RUN INFORMATION
+============================================================
+
+The dashboard should show:
+
+- Last execution date/time
+- Last execution status
+- Last execution duration
+
+The latest relevant execution needs to be identified because the same DAG
+can execute more than once.
+
+Example:
+
+FAILED
+FAILED
+COMPLETED
+
+The current/latest execution status should be COMPLETED.
+
+============================================================
+23. NEXT EXPECTED RUN
+============================================================
+
+The dashboard should show:
+
+next expected run
+
+where it can be reliably determined.
+
+For normal scheduled DAGs, Airflow's:
+
+next_run_time
+
+may be used.
+
+For Master/branch-controlled DAGs, a calculated/manual expected date may
+be required.
+
+The dashboard should not show misleading next-run information when the
+DAG is waiting for the next branch/cycle.
+
+============================================================
+24. PERIODIC DASHBOARD HIGH-LEVEL REQUIREMENT
+============================================================
+
+The dashboard should have KPI cards at the top.
+
+Expected KPIs:
+
+- Total Periodic DAGs
+- Completed
+- Failed
+- In Progress
+- Not Started
+- Waiting for Next Cycle
+
+Paused DAGs should NOT be counted as a separate operational status KPI.
+
+============================================================
+25. PERIODIC DASHBOARD SLICERS
+============================================================
+
+Recommended filters include:
+
+- Source System
+- DAG Type
+- Frequency
+- Status
+- Master DAG
+
+Potentially:
+
+- Scheduling Type
+- Execution Branch
+
+if useful to the business users.
+
+============================================================
+26. PERIODIC DETAIL TABLE
+============================================================
+
+The main table should allow users to see approximately:
+
+DAG Name
+Master DAG
+Source System
+DAG Type
+Frequency
+Scheduling Type
+Execution Branch
+Branch Priority
+Schedule Description
+Expected Run Date
+Last Run Date
+Last Status
+Current Cycle Status
+Next Expected Run
+Duration
+Paused
+
+
+The exact fields can be refined before implementation.
+
+============================================================
+27. MASTER DAG DISPLAY
+============================================================
+
+For the Periodic Dashboard, do NOT assume that the Master DAG itself has
+a real execution record.
+
+The child DAG execution records are the actual execution evidence.
+
+The dashboard should therefore clearly show:
+
+Master DAG
+Child DAG
+Branch
+Child status
+
+The business user should understand which child belongs to which Master
+workflow and which branch.
+
+============================================================
+28. IMPORTANT: MASTER STATUS
+============================================================
+
+There is an important distinction from the Daily Dashboard.
+
+I do NOT want the Periodic Dashboard to become unnecessarily complicated.
+
+The main purpose is to monitor the individual periodic child DAGs and their
+expected cycles.
+
+If a Master-level summary is required, it should be simple and should not
+require an overly complicated Power BI hierarchy.
+
+The Master DAG does not have its own physical execution record in the
+audit table.
+
+============================================================
+29. PAUSED DAG RULE
+============================================================
+
+Some DAGs can be paused.
+
+The schedule table has:
+
+is_paused
+
+Paused status is useful for operational information.
+
+However:
+
+Paused should NOT be treated as the primary business execution status.
+
+It should not be included as a main KPI status.
+
+============================================================
+30. TIMEZONE
+============================================================
+
+Execution timestamps in dag_execution_audit are stored in UTC.
+
+The operational dashboard uses:
+
+Australia/Melbourne
+
+All expected dates and operational day calculations need to respect this
+timezone.
+
+============================================================
+31. DIRECTQUERY REQUIREMENT
+============================================================
+
+Power BI uses DirectQuery.
+
+Therefore:
+
+- Avoid unnecessary heavy transformations in Power BI.
+- SQL/view performance matters.
+- Avoid unnecessary joins or row multiplication.
+- Avoid duplicate rows caused by branch mappings.
+- Be careful because a child DAG can belong to multiple branches.
+
+============================================================
+32. DUPLICATION CHALLENGE
+============================================================
+
+One major technical/business challenge is:
+
+A child DAG can exist under multiple branches.
+
+Example:
+
+oscar_cd_contributions_LRA
+
+could have:
+
+FIRST_DAY
+WEDNESDAY
+SECOND_DAY
+
+in dag_branch_mapping_pbi.
+
+The dashboard should not incorrectly show three independent expected
+executions for the same child on a date when only one branch is actually
+selected.
+
+Branch priority and actual Master logic must be respected.
+
+============================================================
+33. PERIODIC EXPECTATION CHALLENGE
+============================================================
+
+The biggest business challenge is determining:
+
+"Is this DAG expected to run now?"
+
+A simple check such as:
+
+frequency = MONTHLY
+
+is not enough.
+
+The system may need to know:
+
+- Day of month
+- Day of week
+- Branch condition
+- Branch priority
+- Current month
+- Current week
+- Current cycle
+- Whether the previous cycle completed
+- Whether the next cycle has arrived
+- Airflow next_run_time where available
+
+============================================================
+34. MASTER-TRIGGERED CHALLENGE
+============================================================
+
+For Master-triggered DAGs:
+
+- Child DAG may have schedule = None.
+- Airflow may not provide a meaningful next execution.
+- The Master branch logic determines whether it is expected.
+- Some child DAGs belong to multiple branches.
+- Branch priority determines which branch is selected.
+- The Master itself is not necessarily recorded in the execution audit.
+
+Only a small number of Master DAGs have complex branching.
+
+Manual metadata maintenance is acceptable.
+
+============================================================
+35. CURRENT METADATA TABLE DESIGN
+============================================================
+
+Current physical metadata tables are:
+
+1.
+
+job_audit.dag_inventory_pbi
+
+Columns:
+
+dag_name
+source_system
+dag_type
+frequency
+scheduling_type
+master_dag_name
+dashboard_group
+
+
+2.
+
+job_audit.dag_branch_mapping_pbi
+
+Columns:
+
+master_dag_name
+execution_branch
+branch_priority
+dag_name
+
+
+These tables are manually maintained.
+
+I am comfortable creating another metadata table if there is a strong
+business/technical requirement, but I do not want unnecessary physical
+tables.
+
+============================================================
+36. CURRENT DATASET SIZE
+============================================================
+
+Approximate scale:
+
+- Around 300-400 DAGs need manual metadata maintenance.
+- Maximum around 10 Master DAGs.
+- Around 300 child DAGs associated with Master DAGs.
+- Only around 3-4 Master DAGs currently have complex branching.
+- Periodic metadata test dataset currently contains 30+ rows.
+- Branch mapping test dataset currently contains approximately 36 rows.
+
+============================================================
+37. WHAT THE PERIODIC PAGE SHOULD NOT DO
+============================================================
+
+Do NOT make this page:
+
+- A historical trend dashboard
+- An SLA dashboard
+- A complete Airflow administration dashboard
+- A replacement for Airflow UI
+- A complicated hierarchy solely for Master DAG visualization
+
+Historical trends and SLA monitoring may be developed later.
+
+============================================================
+38. FUTURE REQUIREMENTS
+============================================================
+
+Future pages may include:
+
+- Historical DAG success/failure trends
+- SLA monitoring
+- Runtime trends
+- Monthly trends
+- Day-wise execution trends
+- Long-running DAG analysis
+- Historical performance
+
+These are OUT OF SCOPE for the current Periodic page.
+
+============================================================
+39. CURRENT DAILY DASHBOARD
+============================================================
+
+The Daily Dashboard is already implemented and working.
+
+It contains:
+
+- Total DAG KPI
+- Completed KPI
+- Failed KPI
+- In Progress KPI
+- Not Started KPI
+- Source System slicer
+- DAG Type slicer
+- DAG Status slicer
+- Detailed DAG table
+- Successful-run duration chart
+- DAG type distribution
+- Execution status overview
+- Last refresh information
+
+The Daily view already handles:
+
+- Latest execution
+- UTC → Australia/Melbourne conversion
+- NOT_STARTED
+- Duration
+- KPI flags
+- Master/child information
+- Master/child display
+
+The Daily view should NOT be modified as part of this Periodic Dashboard
+design unless there is a clearly identified shared dependency.
+
+============================================================
+40. CURRENT DESIGN PREFERENCE
+============================================================
+
+Keep the Periodic Dashboard understandable.
+
+I do not want to over-engineer Master DAG handling.
+
+The Periodic Dashboard should primarily provide:
+
+1. What periodic jobs exist?
+2. What frequency do they have?
+3. What is the expected execution date?
+4. What was the last execution?
+5. What is the current cycle status?
+6. When is the next expected cycle?
+7. Which Master/branch controls the job?
+8. Which source system does it belong to?
+
+============================================================
+41. EXAMPLE FINAL USER EXPERIENCE
+============================================================
+
+A user opens the Periodic Dashboard.
+
+They should immediately see:
+
+TOTAL PERIODIC DAGs
+COMPLETED
+FAILED
+IN PROGRESS
+NOT STARTED
+WAITING FOR NEXT CYCLE
+
+
+Then they can filter:
+
+Source System
+Frequency
+DAG Type
+Status
+Master DAG
+
+
+The detailed table might look conceptually like:
+
+--------------------------------------------------------------
+DAG Name
+Master DAG
+Branch
+Frequency
+Expected Run
+Last Run
+Last Status
+Current Cycle Status
+Next Expected Run
+--------------------------------------------------------------
+
+job_A
+NULL
+NULL
+Monthly
+02-Sep-2026
+02-Aug-2026
+COMPLETED
+WAITING FOR NEXT CYCLE
+02-Oct-2026
+
+
+job_B
+Oscar_Master
+SECOND_DAY
+Monthly
+02-Sep-2026
+02-Aug-2026
+COMPLETED
+WAITING FOR NEXT CYCLE
+02-Oct-2026
+
+
+job_C
+Oscar_Master
+WEDNESDAY
+Weekly
+26-Aug-2026
+19-Aug-2026
+COMPLETED
+WAITING FOR NEXT CYCLE
+02-Sep-2026
+
+
+job_D
+Oscar_Master
+SECOND_DAY
+Monthly
+02-Sep-2026
+NULL
+NULL
+NOT STARTED
+02-Sep-2026
+
+============================================================
+42. MAIN QUESTIONS THE SOLUTION MUST ANSWER
+============================================================
+
+Before proposing the implementation, make sure the design can correctly
+answer:
+
+1. Is this DAG periodic?
+
+2. What is its frequency?
+
+3. What is its expected run date for the current cycle?
+
+4. Has the current expected cycle arrived?
+
+5. Has the DAG started?
+
+6. Has the DAG completed?
+
+7. Has it failed?
+
+8. Is it still running?
+
+9. Has the current cycle already completed?
+
+10. Should the dashboard say:
+    WAITING FOR NEXT CYCLE?
+
+11. What is the next expected run?
+
+12. Is this DAG controlled by a Master DAG?
+
+13. If yes, which Master DAG?
+
+14. Which branch controls it?
+
+15. What is the branch priority?
+
+16. If the child appears in multiple branches, which branch is actually
+    applicable for the current date?
+
+17. If the 2nd day of the month is Wednesday, how should the branch priority
+    be interpreted?
+
+18. How should a Master-triggered DAG with schedule = None be monitored?
+
+19. How should multiple executions on the same cycle be handled?
+
+20. How can this be implemented efficiently with Power BI DirectQuery?
+
+============================================================
+43. IMPORTANT CONSTRAINT
+============================================================
+
+Do not assume that all periodic scheduling rules can be automatically
+derived from Airflow.
+
+Some business scheduling logic is known only through:
+
+dag_inventory_pbi
+dag_branch_mapping_pbi
+
+Manual metadata maintenance is acceptable.
+
+The design should therefore combine:
+
+- Airflow execution data
+- Airflow schedule data
+- Business metadata
+- Master/branch metadata
+
+where necessary.
+
+============================================================
+44. FINAL OBJECTIVE
+============================================================
+
+Build a reliable Periodic DAG Monitoring page in Power BI that allows
+operations users to understand the status of weekly/monthly/quarterly and
+Master-triggered jobs without needing to inspect Airflow manually.
+
+The most important business concepts are:
+
+EXPECTED RUN
+CURRENT CYCLE
+LAST RUN
+LAST STATUS
+NEXT EXPECTED RUN
+MASTER DAG
+BRANCH
+BRANCH PRIORITY
+WAITING FOR NEXT CYCLE
+
+The solution should be reliable, understandable, maintainable and suitable
+for PostgreSQL + Power BI DirectQuery.
+
+============================================================
+END OF PROJECT CONTEXT
+============================================================
