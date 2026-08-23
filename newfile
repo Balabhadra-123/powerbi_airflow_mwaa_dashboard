@@ -1,0 +1,208 @@
+Yes. I reviewed the two metadata datasets you have manually populated. I can see that you now have enough information to define the Periodic page before we write the SQL view.
+
+I recommend keeping this page focused on cycle/schedule monitoring, rather than making it another copy of the Daily page.
+
+1. What the Periodic page should answer
+
+The main question should be:
+
+“For each periodic DAG, when did it last run, when is it expected next, and what is its status for the current cycle?”
+
+Main table
+
+I suggest the detailed table contain approximately:
+
+Column	Purpose
+DAG Name	Job name
+Master DAG	Parent workflow, if applicable
+Source System	Source/application
+DAG Type	DM / Extract / LRA / etc.
+Frequency	Weekly / Monthly / Quarterly
+Scheduling Type	MASTER / BRANCH / normal schedule
+Schedule Description	Human-readable schedule
+Expected Run Date	Current/next expected cycle date
+Last Run Date	Most recent actual execution
+Last Status	COMPLETED / FAILED / IN PROGRESS
+Current Cycle Status	Expected/Completed/Waiting/Failed
+Next Expected Run	Next cycle
+Duration	Latest execution duration
+Paused	Informational only
+
+⸻
+
+2. The most important field: Current Cycle Status
+
+I would use a small set of business-friendly statuses:
+
+COMPLETED
+
+The expected run for the current cycle has completed successfully.
+
+FAILED
+
+The expected/current cycle has an execution and the latest/current run failed.
+
+IN PROGRESS
+
+The expected run has started but has not completed.
+
+NOT STARTED
+
+The current cycle is expected, but there is no execution yet.
+
+WAITING FOR NEXT CYCLE
+
+The previous expected cycle has completed and the next cycle has not arrived yet.
+
+This last status is particularly useful for the Periodic page, as you previously agreed.
+
+⸻
+
+3. Example
+
+For a monthly DAG running on the 2nd of every month:
+
+DAG	Frequency	Expected Run	Last Run	Current Status
+Job_A	Monthly	02-Aug	02-Aug	WAITING FOR NEXT CYCLE
+
+On September 1:
+
+Expected Run: 02-Sep
+Last Run:     02-Aug
+Status:       NOT STARTED
+
+On September 2 after successful execution:
+
+Expected Run: 02-Sep
+Last Run:     02-Sep
+Status:       COMPLETED
+
+After that cycle is complete:
+
+Status → WAITING FOR NEXT CYCLE
+
+⸻
+
+4. Master/Branch jobs
+
+Your second screenshot is particularly important here.
+
+You have mappings such as:
+
+Oscar master
+    FIRST_DAY
+    SECOND_DAY
+    WEDNESDAY
+
+and individual child DAGs mapped to those branches.
+
+For the Periodic page, I suggest showing the branch information as data, not trying to create a complicated hierarchy.
+
+For example:
+
+Master DAG	Branch	Child DAG	Frequency	Status
+Oscar_Master	SECOND_DAY	Child_A	Monthly	COMPLETED
+Oscar_Master	SECOND_DAY	Child_B	Monthly	COMPLETED
+Oscar_Master	WEDNESDAY	Child_C	Weekly	WAITING FOR NEXT CYCLE
+
+This will make the branch-controlled workflows understandable.
+
+⸻
+
+5. KPI cards
+
+At the top of the Periodic page, I would keep it simple:
+
+Total Periodic DAGs
+
+Completed
+
+In Progress
+
+Failed
+
+Not Started
+
+Waiting for Next Cycle
+
+This gives operations an immediate picture of the periodic workload.
+
+⸻
+
+6. Slicers
+
+I recommend:
+
+* Source System
+* DAG Type
+* Frequency
+* Status
+* Master DAG
+
+You could also have:
+
+* Scheduling Type
+
+but I would only add it if users actually need to filter MASTER vs BRANCH.
+
+⸻
+
+7. One thing I recommend we add before creating the view
+
+I would like the Periodic view to have a clear field called:
+
+expected_run_date
+
+and another:
+
+current_cycle_status
+
+These should become the two most important fields for the Periodic page.
+
+The existing:
+
+frequency
+scheduling_type
+timetable_description
+last_run_time
+next_run_time
+master_dag_name
+execution_branch
+branch_priority
+
+will provide the supporting information.
+
+⸻
+
+Proposed Periodic page structure
+
+┌─────────────────────────────────────────────────────────────┐
+│                 PERIODIC DAG MONITORING                     │
+├─────────────────────────────────────────────────────────────┤
+│ Total │ Completed │ Failed │ In Progress │ Not Started │  │
+│       │           │        │             │ Waiting      │  │
+├─────────────────────────────────────────────────────────────┤
+│ Source System │ Frequency │ Status │ Master DAG │ DAG Type │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ DAG DETAILS                                                 │
+│                                                             │
+│ DAG | Master | Frequency | Expected Run | Last Run | Status │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+
+One important boundary
+
+I would not bring the Daily DAGs into this page just because their scheduling_type is MASTER.
+
+The Periodic page should contain weekly/monthly/quarterly/other periodic workloads. The Daily page remains responsible for the daily workload.
+
+If you’re happy with this high-level design, the next step should be to define exactly how expected_run_date and current_cycle_status will behave for each type:
+
+1. Normal scheduled weekly/monthly DAG
+2. Master-triggered periodic DAG
+3. Branch-controlled DAG
+4. DAG with multiple branches
+5. A cycle that has already completed
+
+Then we can write the Periodic view DDL cleanly without disturbing your working Daily view.
